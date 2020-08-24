@@ -1,0 +1,104 @@
+name: "[Periodic|OBS] Registry:2.0"
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */3 * * *"
+
+jobs:
+  test_suse_private_registry:
+    name: Private Registry
+    runs-on: ecp-runners
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [suse, devel, suse-to-devel]
+        action: [install, upgrade]
+        include:
+          - source: suse
+            # TODO: update this to registry.suse.com when the chart release
+            chart_install_src: registry.suse.de/devel/caps/registry/2.0/charts/harbor:1.4.2
+            chart_upgrade_src: registry.suse.de/devel/caps/registry/2.0/charts/harbor:1.4.2
+          - source: devel
+            chart_install_src: registry.suse.de/devel/caps/registry/2.0/charts/harbor:1.4.2
+            chart_upgrade_src: registry.suse.de/devel/caps/registry/2.0/charts/harbor:1.4.2
+          - source: suse-to-devel
+            # TODO: update this to registry.suse.com when the chart release
+            chart_install_src: registry.suse.de/devel/caps/registry/2.0/charts/harbor:1.4.2
+            chart_upgrade_src: registry.suse.de/devel/caps/registry/2.0/charts/harbor:1.4.2
+        exclude:
+          - source: suse-to-devel
+            action: install
+    env:
+      NAMESPACE: spr20-periodic-${{ matrix.source }}-${{ matrix.action }}
+      HELM_EXPERIMENTAL_OCI: 1
+      HELM_VALUES_FILE: periodic20-${{ matrix.source }}-${{ matrix.action }}-values.yaml
+    steps:
+      - name: Drop KUBECONFIG
+        env:
+          sec_kubeconfig: ${{ secrets.KUBECONFIG }}
+        run: |
+          echo "$sec_kubeconfig" | base64 -d > ./config
+          echo "::set-env name=KUBECONFIG::./config"
+      - name: Get ingress IP
+        run: |
+          echo "::set-env name=INGRESS_IP::$(kubectl get svc nginx-ingress-controller -n nginx-ingress -o json | jq -r ".status.loadBalancer.ingress[].ip")"
+      - name: Generate values file
+        run: |
+          cat << EOF | tee ${HELM_VALUES_FILE}
+          expose:
+            ingress:
+              hosts:
+                core: "${NAMESPACE}.${INGRESS_IP}.nip.io"
+          externalURL: "https://${NAMESPACE}.${INGRESS_IP}.nip.io"
+          updateStrategy:
+            type: Recreate
+          internalTLS:
+            enabled: false
+          imagePullPolicy: Always
+          EOF
+      - name: Delete previous deployment
+        if: ${{ matrix.action == 'install' || matrix.source == 'suse-to-devel' }}
+        run: |
+          kubectl delete ns ${NAMESPACE} || true
+          kubectl create ns ${NAMESPACE}
+      - name: Create GitHub deployment
+        uses: chrnorm/deployment-action@releases/v1
+        id: deployment
+        with:
+          token: "${{ github.token }}"
+          environment: periodic-2.0 (${{ matrix.source }}, ${{ matrix.action }})
+      - name: SUSE Private Registry (install)
+        if: ${{ matrix.action == 'install' || matrix.source == 'suse-to-devel' }}
+        run: |
+          helm chart pull ${{ matrix.chart_install_src }}
+          helm chart export ${{ matrix.chart_install_src }}
+          helm install ${NAMESPACE} ./harbor -n ${NAMESPACE} --values ${HELM_VALUES_FILE} --timeout 8m --wait
+      - name: SUSE Private Registry (upgrade)
+        if: ${{ matrix.action == 'upgrade' || matrix.source == 'suse-to-devel' }}
+        run: |
+          kubectl create ns ${NAMESPACE} || true
+          helm chart pull ${{ matrix.chart_upgrade_src }}
+          helm chart export ${{ matrix.chart_upgrade_src }}
+          helm upgrade ${NAMESPACE} ./harbor -n ${NAMESPACE} --values ${HELM_VALUES_FILE} --install --timeout 8m --wait
+      - name: Run tests
+        run: |
+          echo "helm test ${NAMESPACE} -n ${NAMESPACE} --timeout 30m"
+      - name: Archive test results
+        run: |
+          echo "archive test logs/reports"
+      - name: Update deployment status (success)
+        if: success()
+        uses: chrnorm/deployment-status@releases/v1
+        with:
+          token: "${{ github.token }}"
+          environment_url: https://${{ env.NAMESPACE }}.${{ env.INGRESS_IP }}.nip.io
+          state: "success"
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+      - name: Update deployment status (failure)
+        if: failure()
+        uses: chrnorm/deployment-status@releases/v1
+        with:
+          token: "${{ github.token }}"
+          environment_url: https://${{ env.NAMESPACE }}.${{ env.INGRESS_IP }}.nip.io
+          state: "failure"
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
