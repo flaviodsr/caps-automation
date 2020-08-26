@@ -2,7 +2,7 @@ name: "[Periodic|OBS] Registry:2.0"
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */3 * * *"
+    - cron: "0 */2 * * *"
 
 jobs:
   test_suse_private_registry:
@@ -39,9 +39,15 @@ jobs:
         uses: actions/checkout@v2
         with:
           ref: release-2.0
+      - name: Get ACTIVE_CLUSTER
+        id: active_cluster
+        run: |
+          active_cluster=$(echo "${{ secrets.ACTIVE_CLUSTER }}" | base64 -d)
+          echo "::set-output name=kubeconfig_secret_name::KUBECONFIG_${active_cluster^^}"
+          echo "::warning::Using cluster ${active_cluster}"
       - name: Drop KUBECONFIG
         env:
-          sec_kubeconfig: ${{ secrets.KUBECONFIG }}
+          sec_kubeconfig: ${{ secrets[steps.active_cluster.outputs.kubeconfig_secret_name] }}
         run: |
           echo "$sec_kubeconfig" | base64 -d > ./config
           echo "::set-env name=KUBECONFIG::./config"
@@ -99,13 +105,56 @@ jobs:
             echo "::warning::Upgraded from ${GITHUB_REPOSITORY}:release-2.0"
           fi
           [ "${{ matrix.source }}" = "suse-to-devel" ] && chart_values_file=values-dev.yaml || chart_values_file=${{ matrix.chart_values_file }}
-          helm upgrade ${NAMESPACE} ./${chart_dir} -n ${NAMESPACE} --values ${chart_dir}/${{ matrix.chart_values_file }} --values ${CI_HELM_VALUES_FILE} --install --timeout 8m --wait
+          helm upgrade ${NAMESPACE} ./${chart_dir} -n ${NAMESPACE} --values ${chart_dir}/${chart_values_file} --values ${CI_HELM_VALUES_FILE} --install --timeout 8m --wait
       - name: Run tests
+        if: matrix.source != 'suse'
+        id: run_tests
         run: |
-          echo "helm test ${NAMESPACE} -n ${NAMESPACE} --timeout 30m"
+          set +e
+          release_name=${NAMESPACE}
+          namespace=${NAMESPACE}
+          helm test -n $namespace $release_name --timeout 30m &
+          P1=$!
+          test_pods=$(helm status -n $namespace $release_name -o json | jq -r .hooks[].name)
+          until kubectl exec -n $namespace $test_pods "--" ls -lh /var/lib/harbor-test/report.html &> /dev/null; do
+            sleep 1
+          done
+          kubectl cp -n $namespace $test_pods:/var/lib/harbor-test/output.xml output.xml &> /dev/null
+          wait $P1
+          status=$?
+          if rebot --log api_log.html --report api_report.html --xunit api_xunit.xml output.xml; then
+            echo "::set-output name=has_artifacts::true"
+          fi
+          for test_pod in $test_pods; do
+            test_containers=$(kubectl -n $namespace get pod $test_pod -o json | jq -r .spec.containers[].name | tac)
+            for test_container in $test_containers; do
+              echo ""
+              echo "#######################################################################"
+              echo ""
+              echo "Logs from pod/container: "
+              echo "  $test_pod/$test_container"
+              echo ""
+              echo "#######################################################################"
+              echo ""
+              kubectl -n $namespace logs $test_pod -c $test_container
+              echo ""
+            done
+          done
+          exit $status
       - name: Archive test results
-        run: |
-          echo "archive test logs/reports"
+        if: always() && steps.run_tests.outputs.has_artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: test_results
+          path: api_*
+      - name: Proccess test results
+        if: always() && steps.run_tests.outputs.has_artifacts
+        uses: ashley-taylor/junit-report-annotations-action@master
+        with:
+          name: Test Results (${{ matrix.source }}, ${{ matrix.action }})
+          path: api_xunit.xml
+          numFailures: 50
+          access-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Update deployment status (success)
         if: success()
         uses: chrnorm/deployment-status@releases/v1

@@ -1,10 +1,12 @@
-name: "Rotate CaaSP Clusters"
+name: "[Periodic|CaaSP 4] Rotate Cluster"
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 */3 * * *"
 
 jobs:
   redeploy_caasp_cluster:
-    name: Deploy and set active cluster
+    name: Redeploy and set active cluster
     runs-on: ecp-runners
     env:
       CLUSTER_PREFIX: registryci
@@ -72,9 +74,8 @@ jobs:
           eval $(ssh-agent)
           echo "::set-output name=step_reached::true"
           OWNER=${CLUSTER_NAME} BACKEND=caasp4os make k8s
-          echo "::set-output name=kubeconfig::$(base64 build${{ env.CLUSTER_NAME }}/kubeconfig)"
+          echo "::set-output name=kubeconfig::$(base64 -w0 build${{ env.CLUSTER_NAME }}/kubeconfig)"
           echo "::set-env name=KUBECONFIG::$(realpath build${{ env.CLUSTER_NAME }}/kubeconfig)"
-          kubectl --kubeconfig build${{ env.CLUSTER_NAME }}/kubeconfig get nodes -o wide
       - name: Archieve deployment artifacts
         if: always() && steps.deploy_cluster.outputs.step_reached
         uses: actions/upload-artifact@v2
