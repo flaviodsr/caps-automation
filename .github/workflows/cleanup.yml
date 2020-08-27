@@ -1,0 +1,60 @@
+name: "[CLEANUP] Environments"
+on:
+  pull_request:
+    types: [closed]
+  release:
+    types: [released, deleted]
+  
+jobs:
+  prune_transient_environments:
+    name: Delete environments
+    runs-on: ecp-runners
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [suse, devel, suse-to-devel]
+        action: [install, upgrade]
+        exclude:
+          - source: suse-to-devel
+            action: install
+    steps:
+      - name: Setup environment for trigger event ${{ github.event_name }}
+        id: setup
+        run: |
+          case "${GITHUB_EVENT_NAME}" in
+            pull_request)
+              pr_number=$(jq --raw-output .pull_request.number ${GITHUB_EVENT_PATH})
+              echo "::set-output name=env_name::pr-${pr_number}"
+              echo "::set-env name=NAMESPACE::spr20-pr${pr_number}-${{ matrix.source }}-${{ matrix.action }}"
+              ;;
+            release)
+              tag=${GITHUB_REF##*/}
+              echo "::set-output name=env_name::tag-${tag}"
+              echo "::set-env name=NAMESPACE::spr20-rel$(echo ${tag} | tr . -)-${{ matrix.source }}-${{ matrix.action }}"
+              ;;
+            *)
+              echo "::error::Trigger event ${GITHUB_EVENT_NAME} not supported by this workflow"
+              exit 1
+          esac
+      - name: Get ACTIVE_CLUSTER
+        id: active_cluster
+        run: |
+          active_cluster=$(echo "${{ secrets.ACTIVE_CLUSTER }}" | base64 -d)
+          echo "::set-output name=kubeconfig_secret_name::KUBECONFIG_${active_cluster^^}"
+          echo "::warning::Using cluster ${active_cluster}"
+      - name: Drop KUBECONFIG
+        env:
+          sec_kubeconfig: ${{ secrets[steps.active_cluster.outputs.kubeconfig_secret_name] }}
+        run: |
+          echo "$sec_kubeconfig" | base64 -d > ./config
+          echo "::set-env name=KUBECONFIG::./config"
+      - name: Delete deployment
+        run: kubectl delete ns ${NAMESPACE} || true  
+      - name: Delete GitHub deployments
+        run: |
+          env="${{ steps.setup.outputs.env_name }} (${{ matrix.source }}, ${{ matrix.action }})"
+          repo=${{ github.repository }}
+          for id in $(curl -H "authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/$repo/deployments\?environment\=${env// /%20} | jq ".[].id"); do
+            curl -X POST -H "authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -d '{"state":"inactive"}' -H 'accept: application/vnd.github.ant-man-preview+json' https://api.github.com/repos/$repo/deployments/$id/statuses
+            curl -X DELETE -H "authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/$repo/deployments/$id
+          done
