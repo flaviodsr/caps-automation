@@ -3,11 +3,15 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "0 */2 * * *"
+  release:
+    types: [published]
+  pull_request:
 
 jobs:
   test_suse_private_registry:
     name: Private Registry
     runs-on: ecp-runners
+    #if: github.repository == 'SUSE/registry'
     strategy:
       fail-fast: false
       matrix:
@@ -34,140 +38,157 @@ jobs:
       NAMESPACE: spr20-periodic-${{ matrix.source }}-${{ matrix.action }}
       HELM_EXPERIMENTAL_OCI: 1
       CI_HELM_VALUES_FILE: periodic20-${{ matrix.source }}-${{ matrix.action }}-values.yaml
+      GIT_SCHEDULE_BRANCH: "release-2.0"
     steps:
-      - name: Checkout ${{ github.repository }}:release-2.0
+      - name: Setup source
+        id: source
+        run: |
+          case "${GITHUB_EVENT_NAME}" in
+            schedule)
+              echo "::set-output name=ref::${GIT_DEFAULT_BRANCH}"
+              echo "::set-output name=ref_name::${GIT_DEFAULT_BRANCH}"
+              ;;
+            pull_request)
+              echo "::set-output name=ref_name::PR-${{ github.head_ref }}"
+              ;;
+            *)
+              echo "::set-output name=ref_name::${{ github.ref }}"
+          esac
+      - name: Checkout ${{ steps.source.outputs.ref_name }}
         uses: actions/checkout@v2
         with:
-          ref: release-2.0
-      - name: Get ACTIVE_CLUSTER
-        id: active_cluster
-        run: |
-          active_cluster=$(echo "${{ secrets.ACTIVE_CLUSTER }}" | base64 -d)
-          echo "::set-output name=kubeconfig_secret_name::KUBECONFIG_${active_cluster^^}"
-          echo "::warning::Using cluster ${active_cluster}"
-      - name: Drop KUBECONFIG
-        env:
-          sec_kubeconfig: ${{ secrets[steps.active_cluster.outputs.kubeconfig_secret_name] }}
-        run: |
-          echo "$sec_kubeconfig" | base64 -d > ./config
-          echo "::set-env name=KUBECONFIG::./config"
-      - name: Get ingress IP
-        run: |
-          echo "::set-env name=INGRESS_IP::$(kubectl get svc nginx-ingress-controller -n nginx-ingress -o json | jq -r ".status.loadBalancer.ingress[].ip")"
-      - name: Generate values file
-        run: |
-          cat << EOF | tee ${CI_HELM_VALUES_FILE}
-          expose:
-            ingress:
-              hosts:
-                core: "${NAMESPACE}.${INGRESS_IP}.nip.io"
-          externalURL: "https://${NAMESPACE}.${INGRESS_IP}.nip.io"
-          updateStrategy:
-            type: Recreate
-          internalTLS:
-            enabled: false
-          imagePullPolicy: Always
-          EOF
-      - name: Delete previous deployment
-        if: matrix.action == 'install' || matrix.source == 'suse-to-devel'
-        run: |
-          kubectl delete ns ${NAMESPACE} || true
-          kubectl create ns ${NAMESPACE}
-      - name: Create GitHub deployment
-        uses: chrnorm/deployment-action@releases/v1
-        id: deployment
-        with:
-          token: "${{ github.token }}"
-          environment: periodic-2.0 (${{ matrix.source }}, ${{ matrix.action }})
-      - name: SUSE Private Registry (install)
-        if: matrix.action == 'install' || matrix.source == 'suse-to-devel'
-        run: |
-          if $(helm chart pull ${{ matrix.chart_install_src }}); then
-            helm chart export ${{ matrix.chart_install_src }}
-            chart_dir=harbor
-            echo "::warning::Installed from ${{ matrix.chart_install_src }}"
-          else
-            chart_dir=harbor-helm
-            echo "::warning::Installed from ${GITHUB_REPOSITORY}:release-2.0"
-          fi
-          [ "${{ matrix.source }}" = "suse-to-devel" ] && chart_values_file=values.yaml || chart_values_file=${{ matrix.chart_values_file }}
-          helm install ${NAMESPACE} ./${chart_dir} -n ${NAMESPACE} --values ${chart_dir}/${chart_values_file} --values ${CI_HELM_VALUES_FILE} --timeout 8m --wait
-      - name: SUSE Private Registry (upgrade)
-        if: matrix.action == 'upgrade' || matrix.source == 'suse-to-devel'
-        run: |
-          kubectl create ns ${NAMESPACE} || true
-          if $(helm chart pull ${{ matrix.chart_upgrade_src }}); then
-            helm chart export ${{ matrix.chart_upgrade_src }}
-            chart_dir=harbor
-            echo "::warning::Upgraded from ${{ matrix.chart_upgrade_src }}"
-          else
-            chart_dir=harbor-helm
-            echo "::warning::Upgraded from ${GITHUB_REPOSITORY}:release-2.0"
-          fi
-          [ "${{ matrix.source }}" = "suse-to-devel" ] && chart_values_file=values-dev.yaml || chart_values_file=${{ matrix.chart_values_file }}
-          helm upgrade ${NAMESPACE} ./${chart_dir} -n ${NAMESPACE} --values ${chart_dir}/${chart_values_file} --values ${CI_HELM_VALUES_FILE} --install --timeout 8m --wait
-      - name: Run tests
-        if: matrix.source != 'suse'
-        id: run_tests
-        run: |
-          set +e
-          release_name=${NAMESPACE}
-          namespace=${NAMESPACE}
-          helm test -n $namespace $release_name --timeout 30m &
-          P1=$!
-          test_pods=$(helm status -n $namespace $release_name -o json | jq -r .hooks[].name)
-          until kubectl exec -n $namespace $test_pods "--" ls -lh /var/lib/harbor-test/report.html &> /dev/null; do
-            sleep 1
-          done
-          kubectl cp -n $namespace $test_pods:/var/lib/harbor-test/output.xml output.xml &> /dev/null
-          wait $P1
-          status=$?
-          if rebot --log api_log.html --report api_report.html --xunit api_xunit.xml output.xml; then
-            echo "::set-output name=has_artifacts::true"
-          fi
-          for test_pod in $test_pods; do
-            test_containers=$(kubectl -n $namespace get pod $test_pod -o json | jq -r .spec.containers[].name | tac)
-            for test_container in $test_containers; do
-              echo ""
-              echo "#######################################################################"
-              echo ""
-              echo "Logs from pod/container: "
-              echo "  $test_pod/$test_container"
-              echo ""
-              echo "#######################################################################"
-              echo ""
-              kubectl -n $namespace logs $test_pod -c $test_container
-              echo ""
-            done
-          done
-          exit $status
-      - name: Archive test results
-        if: always() && steps.run_tests.outputs.has_artifacts
-        uses: actions/upload-artifact@v2
-        with:
-          name: test_results
-          path: api_*
-      - name: Proccess test results
-        if: always() && steps.run_tests.outputs.has_artifacts
-        uses: ashley-taylor/junit-report-annotations-action@master
-        with:
-          name: Test Results (${{ matrix.source }}, ${{ matrix.action }})
-          path: api_xunit.xml
-          numFailures: 50
-          access-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Update deployment status (success)
-        if: success()
-        uses: chrnorm/deployment-status@releases/v1
-        with:
-          token: "${{ github.token }}"
-          environment_url: https://${{ env.NAMESPACE }}.${{ env.INGRESS_IP }}.nip.io
-          state: "success"
-          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
-      - name: Update deployment status (failure)
-        if: failure()
-        uses: chrnorm/deployment-status@releases/v1
-        with:
-          token: "${{ github.token }}"
-          environment_url: https://${{ env.NAMESPACE }}.${{ env.INGRESS_IP }}.nip.io
-          state: "failure"
-          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          ref: ${{ steps.source.outputs.ref }}
+      - name: Print status
+        run: git status
+      # - name: Get ACTIVE_CLUSTER
+      #   id: active_cluster
+      #   run: |
+      #     active_cluster=$(echo "${{ secrets.ACTIVE_CLUSTER }}" | base64 -d)
+      #     echo "::set-output name=kubeconfig_secret_name::KUBECONFIG_${active_cluster^^}"
+      #     echo "::warning::Using cluster ${active_cluster}"
+      # - name: Drop KUBECONFIG
+      #   env:
+      #     sec_kubeconfig: ${{ secrets[steps.active_cluster.outputs.kubeconfig_secret_name] }}
+      #   run: |
+      #     echo "$sec_kubeconfig" | base64 -d > ./config
+      #     echo "::set-env name=KUBECONFIG::./config"
+      # - name: Get ingress IP
+      #   run: |
+      #     echo "::set-env name=INGRESS_IP::$(kubectl get svc nginx-ingress-controller -n nginx-ingress -o json | jq -r ".status.loadBalancer.ingress[].ip")"
+      # - name: Generate values file
+      #   run: |
+      #     cat << EOF | tee ${CI_HELM_VALUES_FILE}
+      #     expose:
+      #       ingress:
+      #         hosts:
+      #           core: "${NAMESPACE}.${INGRESS_IP}.nip.io"
+      #     externalURL: "https://${NAMESPACE}.${INGRESS_IP}.nip.io"
+      #     updateStrategy:
+      #       type: Recreate
+      #     internalTLS:
+      #       enabled: false
+      #     imagePullPolicy: Always
+      #     EOF
+      # - name: Delete previous deployment
+      #   if: matrix.action == 'install' || matrix.source == 'suse-to-devel'
+      #   run: |
+      #     kubectl delete ns ${NAMESPACE} || true
+      #     kubectl create ns ${NAMESPACE}
+      # - name: Create GitHub deployment
+      #   uses: chrnorm/deployment-action@releases/v1
+      #   id: deployment
+      #   with:
+      #     token: "${{ github.token }}"
+      #     environment: periodic-2.0 (${{ matrix.source }}, ${{ matrix.action }})
+      # - name: SUSE Private Registry (install)
+      #   if: matrix.action == 'install' || matrix.source == 'suse-to-devel'
+      #   run: |
+      #     if $(helm chart pull ${{ matrix.chart_install_src }}); then
+      #       helm chart export ${{ matrix.chart_install_src }}
+      #       chart_dir=harbor
+      #       echo "::warning::Installed from ${{ matrix.chart_install_src }}"
+      #     else
+      #       chart_dir=harbor-helm
+      #       echo "::warning::Installed from ${GITHUB_REPOSITORY}:release-2.0"
+      #     fi
+      #     [ "${{ matrix.source }}" = "suse-to-devel" ] && chart_values_file=values.yaml || chart_values_file=${{ matrix.chart_values_file }}
+      #     helm install ${NAMESPACE} ./${chart_dir} -n ${NAMESPACE} --values ${chart_dir}/${chart_values_file} --values ${CI_HELM_VALUES_FILE} --timeout 8m --wait
+      # - name: SUSE Private Registry (upgrade)
+      #   if: matrix.action == 'upgrade' || matrix.source == 'suse-to-devel'
+      #   run: |
+      #     kubectl create ns ${NAMESPACE} || true
+      #     if $(helm chart pull ${{ matrix.chart_upgrade_src }}); then
+      #       helm chart export ${{ matrix.chart_upgrade_src }}
+      #       chart_dir=harbor
+      #       echo "::warning::Upgraded from ${{ matrix.chart_upgrade_src }}"
+      #     else
+      #       chart_dir=harbor-helm
+      #       echo "::warning::Upgraded from ${GITHUB_REPOSITORY}:release-2.0"
+      #     fi
+      #     [ "${{ matrix.source }}" = "suse-to-devel" ] && chart_values_file=values-dev.yaml || chart_values_file=${{ matrix.chart_values_file }}
+      #     helm upgrade ${NAMESPACE} ./${chart_dir} -n ${NAMESPACE} --values ${chart_dir}/${chart_values_file} --values ${CI_HELM_VALUES_FILE} --install --timeout 8m --wait
+      # - name: Run tests
+      #   if: matrix.source != 'suse'
+      #   id: run_tests
+      #   run: |
+      #     set +e
+      #     release_name=${NAMESPACE}
+      #     namespace=${NAMESPACE}
+      #     helm test -n $namespace $release_name --timeout 30m &
+      #     P1=$!
+      #     test_pods=$(helm status -n $namespace $release_name -o json | jq -r .hooks[].name)
+      #     until kubectl exec -n $namespace $test_pods "--" ls -lh /var/lib/harbor-test/report.html &> /dev/null; do
+      #       sleep 1
+      #     done
+      #     kubectl cp -n $namespace $test_pods:/var/lib/harbor-test/output.xml output.xml &> /dev/null
+      #     wait $P1
+      #     status=$?
+      #     if rebot --log api_log.html --report api_report.html --xunit api_xunit.xml output.xml; then
+      #       echo "::set-output name=has_artifacts::true"
+      #     fi
+      #     for test_pod in $test_pods; do
+      #       test_containers=$(kubectl -n $namespace get pod $test_pod -o json | jq -r .spec.containers[].name | tac)
+      #       for test_container in $test_containers; do
+      #         echo ""
+      #         echo "#######################################################################"
+      #         echo ""
+      #         echo "Logs from pod/container: "
+      #         echo "  $test_pod/$test_container"
+      #         echo ""
+      #         echo "#######################################################################"
+      #         echo ""
+      #         kubectl -n $namespace logs $test_pod -c $test_container
+      #         echo ""
+      #       done
+      #     done
+      #     exit $status
+      # - name: Archive test results
+      #   if: always() && steps.run_tests.outputs.has_artifacts
+      #   uses: actions/upload-artifact@v2
+      #   with:
+      #     name: test_results
+      #     path: api_*
+      # - name: Proccess test results
+      #   if: always() && steps.run_tests.outputs.has_artifacts
+      #   uses: ashley-taylor/junit-report-annotations-action@master
+      #   with:
+      #     name: Test Results (${{ matrix.source }}, ${{ matrix.action }})
+      #     path: api_xunit.xml
+      #     numFailures: 50
+      #     access-token: ${{ secrets.GITHUB_TOKEN }}
+      # - name: Update deployment status (success)
+      #   if: success()
+      #   uses: chrnorm/deployment-status@releases/v1
+      #   with:
+      #     token: "${{ github.token }}"
+      #     environment_url: https://${{ env.NAMESPACE }}.${{ env.INGRESS_IP }}.nip.io
+      #     state: "success"
+      #     deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+      # - name: Update deployment status (failure)
+      #   if: failure()
+      #   uses: chrnorm/deployment-status@releases/v1
+      #   with:
+      #     token: "${{ github.token }}"
+      #     environment_url: https://${{ env.NAMESPACE }}.${{ env.INGRESS_IP }}.nip.io
+      #     state: "failure"
+      #     deployment_id: ${{ steps.deployment.outputs.deployment_id }}
