@@ -37,6 +37,10 @@ jobs:
       HELM_EXPERIMENTAL_OCI: 1
       GIT_DEFAULT_BRANCH: "release-2.0"
     steps:
+      - name: Cancel previous runs
+        uses: styfle/cancel-workflow-action@0.4.1
+        with:
+          access_token: ${{ github.token }}
       - name: Setup for trigger event ${{ github.event_name }}
         id: setup
         run: |
@@ -44,18 +48,23 @@ jobs:
             schedule|workflow_dispatch)
               echo "::set-output name=ref::${GIT_DEFAULT_BRANCH}"
               echo "::set-output name=ref_name::${GIT_DEFAULT_BRANCH}"
+              echo "::set-output name=env_ref::${GIT_DEFAULT_BRANCH}"
               echo "::set-output name=env_name::periodic-2.0"
               echo "::set-env name=NAMESPACE::spr20-sched-${{ matrix.source }}-${{ matrix.action }}"
               ;;
             pull_request)
               pr_number=$(jq --raw-output .pull_request.number ${GITHUB_EVENT_PATH})
+              echo "::set-output name=ref::${{ github.ref }}"
               echo "::set-output name=ref_name::pull/${pr_number}"
+              echo "::set-output name=env_ref::${{ github.head_ref }}"
               echo "::set-output name=env_name::pr-${pr_number}"
               echo "::set-env name=NAMESPACE::spr20-pr${pr_number}-${{ matrix.source }}-${{ matrix.action }}"
               ;;
             release)
               tag=${GITHUB_REF##*/}
+              echo "::set-output name=ref::${{ github.ref }}"
               echo "::set-output name=ref_name::tag-${tag}"
+              echo "::set-output name=env_ref::${tag}"
               echo "::set-output name=env_name::tag-${tag}"
               echo "::set-env name=NAMESPACE::spr20-rel$(echo ${tag} | tr . -)-${{ matrix.source }}-${{ matrix.action }}"
               ;;
@@ -118,13 +127,13 @@ jobs:
         with:
           token: "${{ github.token }}"
           environment: ${{ steps.setup.outputs.env_name }} (${{ matrix.source }}, ${{ matrix.action }})
+          ref: ${{ steps.setup.outputs.env_ref }}
       - name: SUSE Private Registry (install)
         if: matrix.action == 'install' || matrix.source == 'suse-to-devel' || github.event_name == 'pull_request' || github.event_name == 'release'
         run: |
-          if $(helm chart pull ${{ matrix.chart_install_src }}); then
+          if helm chart pull ${{ matrix.chart_install_src }}; then
             helm chart export ${{ matrix.chart_install_src }}
             chart_dir=harbor
-            echo "::warning::Installed from ${{ matrix.chart_install_src }}"
           else
             chart_dir=registry-git/harbor-helm
           fi
@@ -139,10 +148,9 @@ jobs:
         if: matrix.action == 'upgrade' || matrix.source == 'suse-to-devel'
         run: |
           kubectl create ns ${NAMESPACE} || true
-          if $(helm chart pull ${{ matrix.chart_upgrade_src }}); then
+          if helm chart pull ${{ matrix.chart_upgrade_src }}; then
             helm chart export ${{ matrix.chart_upgrade_src }}
             chart_dir=harbor
-            echo "::warning::Upgraded from ${{ matrix.chart_upgrade_src }}"
           else
             chart_dir=registry-git/harbor-helm
           fi
