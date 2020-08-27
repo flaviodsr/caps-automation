@@ -4,7 +4,7 @@ on:
   # schedule:
   #   - cron: "0 */2 * * *"
   release:
-    types: [published]
+    types: [prereleased]
   pull_request:
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
         uses: styfle/cancel-workflow-action@0.4.1
         with:
           access_token: ${{ github.token }}
-      - name: Setup for trigger event ${{ github.event_name }}
+      - name: Setup environment for trigger event ${{ github.event_name }}
         id: setup
         run: |
           case "${GITHUB_EVENT_NAME}" in
@@ -97,7 +97,7 @@ jobs:
       - name: Get ingress IP
         run: |
           echo "::set-env name=INGRESS_IP::$(kubectl get svc nginx-ingress-controller -n nginx-ingress -o json | jq -r ".status.loadBalancer.ingress[].ip")"
-      - name: Generate values file for CI
+      - name: Generate helm values file for CI
         run: |
           cat << EOF | tee ${NAMESPACE}.yaml
           expose:
@@ -122,11 +122,12 @@ jobs:
           ref: ${{ env.GIT_DEFAULT_BRANCH }}
           path: registry-git
       - name: Create GitHub deployment
-        uses: chrnorm/deployment-action@releases/v1
+        uses: tallyb/deployments@0.5.0
         id: deployment
         with:
-          token: "${{ github.token }}"
-          environment: ${{ steps.setup.outputs.env_name }} (${{ matrix.source }}, ${{ matrix.action }})
+          step: start
+          token: ${{ github.token }}
+          env: ${{ steps.setup.outputs.env_name }} (${{ matrix.source }}, ${{ matrix.action }})
           ref: ${{ steps.setup.outputs.env_ref }}
       - name: SUSE Private Registry (install)
         if: matrix.action == 'install' || matrix.source == 'suse-to-devel' || github.event_name == 'pull_request' || github.event_name == 'release'
@@ -205,19 +206,14 @@ jobs:
           path: api_xunit.xml
           numFailures: 50
           access-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Update deployment status (success)
-        if: success()
-        uses: chrnorm/deployment-status@releases/v1
+      - name: Update GitHub deployment status
+        if: always()
+        uses: tallyb/deployments@0.5.0
         with:
-          token: "${{ github.token }}"
-          environment_url: https://${{ env.NAMESPACE }}.${{ env.INGRESS_IP }}.nip.io
-          state: "success"
+          step: finish
+          token: ${{ github.token }}
+          status: ${{ job.status }}
+          env_url: https://${{ env.NAMESPACE }}.${{ env.INGRESS_IP }}.nip.io
+          logs: https://${{ env.NAMESPACE }}.${{ env.INGRESS_IP }}.nip.io
           deployment_id: ${{ steps.deployment.outputs.deployment_id }}
-      - name: Update deployment status (failure)
-        if: failure()
-        uses: chrnorm/deployment-status@releases/v1
-        with:
-          token: "${{ github.token }}"
-          environment_url: https://${{ env.NAMESPACE }}.${{ env.INGRESS_IP }}.nip.io
-          state: "failure"
-          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+
