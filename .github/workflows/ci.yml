@@ -1,0 +1,215 @@
+name: "SUSE Private Registry:2.0"
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "0 */2 * * *"
+  release:
+    types: [published]
+  pull_request:
+
+jobs:
+  test_suse_private_registry:
+    name: Integration Tests
+    runs-on: ecp-runners
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [suse, devel, suse-to-devel]
+        action: [install, upgrade]
+        include:
+          - source: suse
+            # TODO: update this to registry.suse.com when the chart release
+            chart_install_src: registry.suse.de/devel/caps/registry/2.0/charts/harbor:1.4.2
+            chart_upgrade_src: registry.suse.de/devel/caps/registry/2.0/charts/harbor:1.4.2
+            chart_values_file: values.yaml
+          - source: devel
+            chart_install_src: registry.suse.de/devel/caps/registry/2.0/charts/harbor:1.4.2
+            chart_upgrade_src: registry.suse.de/devel/caps/registry/2.0/charts/harbor:1.4.2
+            chart_values_file: values-dev.yaml
+          - source: suse-to-devel
+            # TODO: update this to registry.suse.com when the chart release
+            chart_install_src: registry.suse.de/devel/caps/registry/2.0/charts/harbor:1.4.2
+            chart_upgrade_src: registry.suse.de/devel/caps/registry/2.0/charts/harbor:1.4.2
+        exclude:
+          - source: suse-to-devel
+            action: install
+    env:
+      HELM_EXPERIMENTAL_OCI: 1
+      GIT_DEFAULT_BRANCH: "release-2.0"
+    steps:
+      - name: Setup for trigger event ${{ github.event_name }}
+        id: setup
+        run: |
+          case "${GITHUB_EVENT_NAME}" in
+            schedule|workflow_dispatch)
+              echo "::set-output name=ref::${GIT_DEFAULT_BRANCH}"
+              echo "::set-output name=ref_name::${GIT_DEFAULT_BRANCH}"
+              echo "::set-output name=env_name::periodic-2.0"
+              echo "::set-env name=NAMESPACE::spr20-sched-${{ matrix.source }}-${{ matrix.action }}"
+              ;;
+            pull_request)
+              pr_number=$(jq --raw-output .pull_request.number ${GITHUB_EVENT_PATH})
+              echo "::set-output name=ref_name::pull/${pr_number}"
+              echo "::set-output name=env_name::pr-${pr_number}"
+              echo "::set-env name=NAMESPACE::spr20-pr${pr_number}-${{ matrix.source }}-${{ matrix.action }}"
+              ;;
+            release)
+              tag=${GITHUB_REF##*/}
+              echo "::set-output name=ref_name::tag-${tag}"
+              echo "::set-output name=env_name::tag-${tag}"
+              echo "::set-env name=NAMESPACE::spr20-rel$(echo ${tag} | tr . -)-${{ matrix.source }}-${{ matrix.action }}"
+              ;;
+            *)
+              echo "::error::Trigger event ${GITHUB_EVENT_NAME} not supported by this workflow"
+              exit 1
+          esac
+      - name: Checkout ${{ steps.setup.outputs.ref_name }}
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ steps.setup.outputs.ref }}
+          path: registry-git
+      - name: Get ACTIVE_CLUSTER
+        id: active_cluster
+        run: |
+          active_cluster=$(echo "${{ secrets.ACTIVE_CLUSTER }}" | base64 -d)
+          echo "::set-output name=kubeconfig_secret_name::KUBECONFIG_${active_cluster^^}"
+          echo "::warning::Using cluster ${active_cluster}"
+      - name: Drop KUBECONFIG
+        env:
+          sec_kubeconfig: ${{ secrets[steps.active_cluster.outputs.kubeconfig_secret_name] }}
+        run: |
+          echo "$sec_kubeconfig" | base64 -d > ./config
+          echo "::set-env name=KUBECONFIG::./config"
+      - name: Delete previous deployment
+        if: matrix.action == 'install' || matrix.source == 'suse-to-devel' || github.event_name == 'pull_request' || github.event_name == 'release'
+        run: |
+          kubectl delete ns ${NAMESPACE} || true
+          kubectl create ns ${NAMESPACE}
+      - name: Get ingress IP
+        run: |
+          echo "::set-env name=INGRESS_IP::$(kubectl get svc nginx-ingress-controller -n nginx-ingress -o json | jq -r ".status.loadBalancer.ingress[].ip")"
+      - name: Generate values file for CI
+        run: |
+          cat << EOF | tee ${NAMESPACE}.yaml
+          expose:
+            ingress:
+              hosts:
+                core: "${NAMESPACE}.${INGRESS_IP}.nip.io"
+          externalURL: "https://${NAMESPACE}.${INGRESS_IP}.nip.io"
+          updateStrategy:
+            type: Recreate
+          internalTLS:
+            enabled: false
+          imagePullPolicy: Always
+          tests:
+            api:
+              include:
+                - health
+          EOF
+      - name: Checkout ${{ env.GIT_DEFAULT_BRANCH }} [PR and Release upgrade only]
+        if: matrix.action == 'upgrade' && (github.event_name == 'pull_request' || github.event_name == 'release')
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ env.GIT_DEFAULT_BRANCH }}
+          path: registry-git
+      - name: Create GitHub deployment
+        uses: chrnorm/deployment-action@releases/v1
+        id: deployment
+        with:
+          token: "${{ github.token }}"
+          environment: ${{ steps.setup.outputs.env_name }} (${{ matrix.source }}, ${{ matrix.action }})
+      - name: SUSE Private Registry (install)
+        if: matrix.action == 'install' || matrix.source == 'suse-to-devel' || github.event_name == 'pull_request' || github.event_name == 'release'
+        run: |
+          if $(helm chart pull ${{ matrix.chart_install_src }}); then
+            helm chart export ${{ matrix.chart_install_src }}
+            chart_dir=harbor
+            echo "::warning::Installed from ${{ matrix.chart_install_src }}"
+          else
+            chart_dir=registry-git/harbor-helm
+          fi
+          [ "${{ matrix.source }}" = "suse-to-devel" ] && chart_values_file=values.yaml || chart_values_file=${{ matrix.chart_values_file }}
+          helm install ${NAMESPACE} ./${chart_dir} -n ${NAMESPACE} --values ${chart_dir}/${chart_values_file} --values ${NAMESPACE}.yaml --timeout 8m --wait
+      - name: Checkout ${{ steps.setup.outputs.ref_name }} [PR and Release upgrade only]
+        if: matrix.action == 'upgrade' && (github.event_name == 'pull_request' || github.event_name == 'release')
+        uses: actions/checkout@v2
+        with:
+          path: registry-git
+      - name: SUSE Private Registry (upgrade)
+        if: matrix.action == 'upgrade' || matrix.source == 'suse-to-devel'
+        run: |
+          kubectl create ns ${NAMESPACE} || true
+          if $(helm chart pull ${{ matrix.chart_upgrade_src }}); then
+            helm chart export ${{ matrix.chart_upgrade_src }}
+            chart_dir=harbor
+            echo "::warning::Upgraded from ${{ matrix.chart_upgrade_src }}"
+          else
+            chart_dir=registry-git/harbor-helm
+          fi
+          [ "${{ matrix.source }}" = "suse-to-devel" ] && chart_values_file=values-dev.yaml || chart_values_file=${{ matrix.chart_values_file }}
+          helm upgrade ${NAMESPACE} ./${chart_dir} -n ${NAMESPACE} --values ${chart_dir}/${chart_values_file} --values ${NAMESPACE}.yaml --install --timeout 8m --wait
+      - name: Run tests
+        if: matrix.source != 'suse'
+        id: run_tests
+        run: |
+          set +e
+          release_name=${NAMESPACE}
+          namespace=${NAMESPACE}
+          helm test -n $namespace $release_name --timeout 30m &
+          P1=$!
+          test_pods=$(helm status -n $namespace $release_name -o json | jq -r .hooks[].name)
+          until kubectl exec -n $namespace $test_pods "--" ls -lh /var/lib/harbor-test/report.html &> /dev/null; do
+            sleep 1
+          done
+          kubectl cp -n $namespace $test_pods:/var/lib/harbor-test/output.xml output.xml &> /dev/null
+          wait $P1
+          status=$?
+          if rebot --log api_log.html --report api_report.html --xunit api_xunit.xml output.xml; then
+            echo "::set-output name=has_artifacts::true"
+          fi
+          for test_pod in $test_pods; do
+            test_containers=$(kubectl -n $namespace get pod $test_pod -o json | jq -r .spec.containers[].name | tac)
+            for test_container in $test_containers; do
+              echo ""
+              echo "#######################################################################"
+              echo ""
+              echo "Logs from pod/container: "
+              echo "  $test_pod/$test_container"
+              echo ""
+              echo "#######################################################################"
+              echo ""
+              kubectl -n $namespace logs $test_pod -c $test_container
+              echo ""
+            done
+          done
+          exit $status
+      - name: Archive test results
+        if: always() && steps.run_tests.outputs.has_artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: test_results
+          path: api_*
+      - name: Proccess test results
+        if: always() && steps.run_tests.outputs.has_artifacts
+        uses: ashley-taylor/junit-report-annotations-action@master
+        with:
+          name: Test Results (${{ matrix.source }}, ${{ matrix.action }})
+          path: api_xunit.xml
+          numFailures: 50
+          access-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Update deployment status (success)
+        if: success()
+        uses: chrnorm/deployment-status@releases/v1
+        with:
+          token: "${{ github.token }}"
+          environment_url: https://${{ env.NAMESPACE }}.${{ env.INGRESS_IP }}.nip.io
+          state: "success"
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+      - name: Update deployment status (failure)
+        if: failure()
+        uses: chrnorm/deployment-status@releases/v1
+        with:
+          token: "${{ github.token }}"
+          environment_url: https://${{ env.NAMESPACE }}.${{ env.INGRESS_IP }}.nip.io
+          state: "failure"
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
