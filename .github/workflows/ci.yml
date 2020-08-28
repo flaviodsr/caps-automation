@@ -8,6 +8,28 @@ on:
   pull_request:
 
 jobs:
+  test_package_lint:
+    name: Package and Lint chart
+    runs-on: ecp-runners
+    if: github.event_name == 'pull_request' || github.event_name == 'release'
+    strategy:
+      fail-fast: false
+      matrix:
+        values_file: [values, values-dev]
+    env:
+      CHART_PATH: ./harbor-helm
+    steps:
+      - name: Cancel previous runs
+        uses: styfle/cancel-workflow-action@0.4.1
+        with:
+          access_token: ${{ github.token }}
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Package chart
+        run: helm package ${CHART_PATH}
+      - name: Lint chart
+        run: helm lint ${CHART_PATH} --values ${CHART_PATH}/${{ matrix.values_file }}.yaml
+
   test_suse_private_registry:
     name: Integration Tests
     runs-on: ecp-runners
