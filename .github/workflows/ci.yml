@@ -5,7 +5,7 @@ on:
     - cron: "0 */2 * * *"
   release:
     types: [prereleased]
-  pull_request:
+  # pull_request:
 
 jobs:
   test_package_lint:
@@ -99,7 +99,7 @@ jobs:
         with:
           ref: ${{ steps.setup.outputs.ref }}
           path: registry-git
-      - name: Get ACTIVE_CLUSTER
+      - name: Get ACTIVE CLUSTER and set KUBECONFIG
         id: active_cluster
         run: |
           active_cluster=$(echo "${{ secrets.ACTIVE_CLUSTER }}" | base64 -d)

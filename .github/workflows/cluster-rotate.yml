@@ -9,43 +9,52 @@ jobs:
     name: Redeploy and set active cluster
     runs-on: ecp-runners
     env:
-      CLUSTER_PREFIX: registryci
+      CLUSTER_PREFIX: registry-ci
       NUMBER_OF_CLUSTERS: 2
     steps:
       - name: Find out which cluster to redeploy
-        id: get_cluster
-        env:
-          sec_active_cluster: ${{ secrets.ACTIVE_CLUSTER }}
         run: |
-          active_cluster=$(echo $sec_active_cluster | base64 -d)
-          active_cluster_id=${active_cluster: -1}
-          if [[ -z "${{ secrets.ACTIVE_CLUSTER }}" || ${active_cluster_id} = ${NUMBER_OF_CLUSTERS} ]]; then
-            cluster_id=1
-          else
-            cluster_id=$(($active_cluster_id + 1))
+          cluster_id=1
+          artifacts_url=$(curl -H "authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/cluster-rotate.yml/runs\?per_page\=1\&status\=completed \
+            | jq -r ".workflow_runs[].artifacts_url")
+          if [[ ! -z "$artifacts_url" ]]; then
+            artifact_name=cluster-id
+            artifact_download_url=$(curl -H "authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" $artifacts_url \
+              | jq -rc ".artifacts[] | select(.name==\"${artifact_name}\") | .archive_download_url")          
+            curl -LH "authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" $artifact_download_url --output ${artifact_name}.zip
+            rm -rf ${artifact_name}
+            mkdir ${artifact_name}
+            unzip ${artifact_name}.zip -d ${artifact_name}
+            active_cluster_id=$(cat ${artifact_name}/CLUSTER_ID)
+            echo "::set-env name=ACTIVE_CLUSTER_ID::${active_cluster_id}"
+            if [[ -z "${active_cluster_id}" || ${active_cluster_id} = ${NUMBER_OF_CLUSTERS} ]]; then
+              cluster_id=1
+            else
+              cluster_id=$(($active_cluster_id + 1))
+            fi
           fi
-          echo "::set-output name=cluster_to_deploy::$(echo $CLUSTER_PREFIX$cluster_id | base64)"
-          echo "::set-output name=last_run_secret_name::CLUSTER_ROTATE_RUN_ID_${CLUSTER_PREFIX}${cluster_id}"
+          echo ${cluster_id} > CLUSTER_ID
           echo "::set-env name=CLUSTER_NAME::${CLUSTER_PREFIX}${cluster_id}"
+          echo "::set-env name=PREVIOUS_JOB_ARTIFACTS_URL::${artifacts_url}"
           echo "::warning::Redeploying cluster ${CLUSTER_PREFIX}${cluster_id}"
       - name: Drop OPENRC
         env:
           sec_openrc: ${{ secrets.OPENRC }}
         run: echo "$sec_openrc" | base64 -d > ./.openrc
-      - name: Get arficats from previuos run
+      - name: '[CLEAN UP]Get catapult arficats from previuos run'
+        if: ${{ env.PREVIOUS_JOB_ARTIFACTS_URL }}
         id: artifact_download
         run: |
-          if [[ ! -z "${{ secrets[steps.get_cluster.outputs.last_run_secret_name] }}" ]]; then
-            artifact_name=deployment-${CLUSTER_NAME}
-            URL="https://api.github.com/repos/flaviodsr/registry/actions/runs/${{ secrets[steps.get_cluster.outputs.last_run_secret_name] }}/artifacts"
-            artifact_url=$(curl -H "authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" $URL | jq -rc ".artifacts[] | select(.name==\"${artifact_name}\") | .archive_download_url")
-            curl -LH "authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" $artifact_url --output ${artifact_name}.zip
-            rm -rf ${artifact_name}
-            mkdir ${artifact_name}
-            unzip ${artifact_name}.zip -d ${artifact_name}
-            echo "::set-output name=succeeded::true"
-          fi
-      - name: '[CLEANUP] Delete non kubernetes system namespaces'
+          artifact_name=deployment-${CLUSTER_NAME}
+          artifact_url=$(curl -H "authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" ${PREVIOUS_JOB_ARTIFACTS_URL} \
+            | jq -rc ".artifacts[] | select(.name==\"${artifact_name}\") | .archive_download_url")
+          curl -LH "authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" $artifact_url --output ${artifact_name}.zip
+          rm -rf ${artifact_name}
+          mkdir ${artifact_name}
+          unzip ${artifact_name}.zip -d ${artifact_name}
+          echo "::set-output name=succeeded::true"
+      - name: '[CLEAN UP] Delete non kubernetes system namespaces'
         if: ${{ steps.artifact_download.outputs.succeeded }}
         run: |
           if [[ -f "deployment-${CLUSTER_NAME}/kubeconfig" ]]; then
@@ -54,7 +63,7 @@ jobs:
               kubectl delete ns $n
             done
           fi
-      - name: '[CLEANUP] Delete cluster resources on ECP'
+      - name: '[CLEAN UP] Delete virtual resources on ECP'
         if: ${{ steps.artifact_download.outputs.succeeded }}
         run: |
           . ./.openrc
@@ -85,14 +94,6 @@ jobs:
             catapult/build${{ env.CLUSTER_NAME }}/deployment
             catapult/build${{ env.CLUSTER_NAME }}/id_rsa_shared
             catapult/build${{ env.CLUSTER_NAME }}/kubeconfig
-      - name: Update CLUSTER_ROTATE_RUN_ID_${{ env.CLUSTER_NAME }}
-        if: always() && steps.deploy_cluster.outputs.step_reached
-        uses: hmanzur/actions-set-secret@v2.0.0
-        with:
-          name: CLUSTER_ROTATE_RUN_ID_${{ env.CLUSTER_NAME }}
-          value: ${{ github.run_id }}
-          repository: flaviodsr/registry
-          token: ${{ secrets.REPO_ACCESS_TOKEN }}
       - name: Deploy NGINX ingress controller
         run: |
           cat << EOF | tee nginx-ingress-config-values.yaml
@@ -107,17 +108,12 @@ jobs:
           helm -n nginx-ingress install nginx-ingress suse/nginx-ingress -f nginx-ingress-config-values.yaml --wait --timeout 5m
           kubectl -n nginx-ingress get pods
           kubectl -n nginx-ingress get svc
-      - name: Update KUBECONFIG_${{ env.CLUSTER_NAME }}
-        uses: hmanzur/actions-set-secret@v2.0.0
+      - name: Keep current cluster as active if this deployment fails
+        if: failure()
+        run: echo ${ACTIVE_CLUSTER_ID} > CLUSTER_ID
+      - name: Save active cluster ID for ${{ env.CLUSTER_NAME }}
+        if: always()
+        uses: actions/upload-artifact@v2
         with:
-          name: KUBECONFIG_${{ env.CLUSTER_NAME }}
-          value: ${{ steps.deploy_cluster.outputs.kubeconfig }}
-          repository: flaviodsr/registry
-          token: ${{ secrets.REPO_ACCESS_TOKEN }}
-      - name: Update ACTIVE_CLUSTER
-        uses: hmanzur/actions-set-secret@v2.0.0
-        with:
-          name: ACTIVE_CLUSTER
-          value: ${{ steps.get_cluster.outputs.cluster_to_deploy }}
-          repository: flaviodsr/registry
-          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          name: cluster-id
+          path: CLUSTER_ID
