@@ -1,0 +1,5 @@
+-P ecosystem-ci-runners=gha-local-runner:latest
+-C act/
+-W ../.github/workflows
+-b
+-a local

@@ -34,26 +34,35 @@ jobs:
         run: |
           case "${GITHUB_EVENT_NAME}" in
             schedule|workflow_dispatch)
+              working_dir="test_suse_private_registry/spr20-sched-${{ matrix.source }}-${{ matrix.action }}"
               echo "::set-output name=env_ref::release-2.0"
               echo "::set-output name=env_name::periodic-2.0"
               echo "::set-env name=NAMESPACE::spr20-sched-${{ matrix.source }}-${{ matrix.action }}"
+              echo "::set-env name=WORKING_DIR::${working_dir}"
               ;;
             *)
               echo "::error::Trigger event ${GITHUB_EVENT_NAME} not supported by this workflow"
               exit 1
           esac
+          rm -rf ${working_dir}
+          mkdir -p ${working_dir}
       - name: Fetch kubeconfig from active CaaSP cluster
         run: |
-          GH_API_HEADER="authorization: Bearer ${{ secrets.GITHUB_TOKEN }}"
-          active_cluster_artifacts_url=$(curl -sH "${GH_API_HEADER}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/cluster-rotate.yml/runs\?status\=success \
-            | jq -r ".workflow_runs[0].artifacts_url")
-          kubconfig_artifact_download_url=$(curl -sH "${GH_API_HEADER}" ${active_cluster_artifacts_url} \
-            | jq -rc ".artifacts[] | select(.name | contains(\"deployment-registry-ci\")) | .archive_download_url")
-          catapult_deployment_zip="catapult_deployment.zip"
-          curl -sLH "${GH_API_HEADER}" $kubconfig_artifact_download_url --output "${catapult_deployment_zip}"
-          unzip -jo ${catapult_deployment_zip} kubeconfig
-          echo "::set-env name=KUBECONFIG::$(realpath ./kubeconfig)"
+          if [[ "${GITHUB_ACTOR}" != "local" ]]; then
+            GH_API_HEADER="authorization: Bearer ${{ secrets.GITHUB_TOKEN }}"
+            active_cluster_artifacts_url=$(curl -sH "${GH_API_HEADER}" \
+              https://api.github.com/repos/${{ github.repository }}/actions/workflows/cluster-rotate.yml/runs\?status\=success \
+              | jq -r ".workflow_runs[0].artifacts_url")
+            kubconfig_artifact_download_url=$(curl -sH "${GH_API_HEADER}" ${active_cluster_artifacts_url} \
+              | jq -rc ".artifacts[] | select(.name | contains(\"deployment-registry-ci\")) | .archive_download_url")
+            catapult_deployment_zip="catapult_deployment.zip"
+            curl -sLH "${GH_API_HEADER}" $kubconfig_artifact_download_url --output "${catapult_deployment_zip}"
+            unzip -jo ${catapult_deployment_zip} kubeconfig
+            kubeconfig="./kubeconfig"
+          else
+            kubeconfig="$(find . -name kubeconfig -print -quit 2>/dev/null)"
+          fi
+          echo "::set-env name=KUBECONFIG::$(realpath ${kubeconfig})"
       - name: Delete previous deployment
         if: matrix.action == 'install' || matrix.source == 'suse-to-devel'
         run: |
@@ -64,7 +73,7 @@ jobs:
           echo "::set-env name=INGRESS_IP::$(kubectl get svc nginx-ingress-controller -n nginx-ingress -o json | jq -r ".status.loadBalancer.ingress[].ip")"
       - name: Generate helm values file for CI
         run: |
-          cat << EOF | tee ${NAMESPACE}.yaml
+          cat << EOF | tee ${WORKING_DIR}/${NAMESPACE}.yaml
           expose:
             ingress:
               hosts:
@@ -77,8 +86,9 @@ jobs:
           imagePullPolicy: Always
           EOF
       - name: Create GitHub deployment
-        uses: tallyb/deployments@0.5.0
+        if: gihub.actor != 'local'
         id: deployment
+        uses: tallyb/deployments@0.5.0
         with:
           step: start
           token: ${{ github.token }}
@@ -88,27 +98,30 @@ jobs:
         if: matrix.action == 'install' || matrix.source == 'suse-to-devel'
         run: |
           helm chart pull ${{ matrix.install_src }}/charts/registry/harbor:latest
-          helm chart export ${{ matrix.install_src }}/charts/registry/harbor:latest
-          chart="./harbor"
+          helm chart export ${{ matrix.install_src }}/charts/registry/harbor:latest -d ${WORKING_DIR}
+          chart="./${WORKING_DIR}/harbor"
           # replace images repository according to source
           sed -i 's,registry.suse.com,${{ matrix.install_src }}/containers,g' ${chart}/values.yaml
-          helm install ${NAMESPACE} ${chart} -n ${NAMESPACE} --values ${NAMESPACE}.yaml --timeout 8m --wait
+          helm install ${NAMESPACE} ${chart} -n ${NAMESPACE} --values ${WORKING_DIR}/${NAMESPACE}.yaml \
+            --timeout 8m --wait
       - name: SUSE Private Registry (upgrade)
         if: matrix.action == 'upgrade' || matrix.source == 'suse-to-devel'
         run: |
           kubectl create ns ${NAMESPACE} || true
           helm chart pull ${{ matrix.upgrade_src }}/charts/registry/harbor:latest
-          helm chart export ${{ matrix.upgrade_src }}/charts/registry/harbor:latest
-          chart="./harbor"
+          helm chart export ${{ matrix.upgrade_src }}/charts/registry/harbor:latest -d ${WORKING_DIR}
+          chart="./${WORKING_DIR}/harbor"
           # replace images repository according to source
           sed -i 's,registry.suse.com,${{ matrix.upgrade_src }}/containers,g' ${chart}/values.yaml
-          helm upgrade ${NAMESPACE} ${chart} -n ${NAMESPACE} --values ${NAMESPACE}.yaml --install --timeout 8m --wait
+          helm upgrade ${NAMESPACE} ${chart} -n ${NAMESPACE} --values ${WORKING_DIR}/${NAMESPACE}.yaml \
+            --install --timeout 8m --wait
       - name: Run tests
         id: run_tests
         run: |
           set +e
           release_name=${NAMESPACE}
           namespace=${NAMESPACE}
+          mkdir ${WORKING_DIR}/test_report
           helm test -n $namespace $release_name --timeout 30m &
           helm_test_pid=$!
           test_pods=$(helm status -n $namespace $release_name -o json | jq -r .hooks[].name)
@@ -118,18 +131,18 @@ jobs:
           while kubectl exec -n $namespace $test_pods "--" pgrep pybot &> /dev/null; do
             sleep 1
           done
-          kubectl cp -n $namespace $test_pods:/var/lib/harbor-test/output.xml output.xml
+          kubectl cp -n $namespace $test_pods:/var/lib/harbor-test/output.xml \
+            ${WORKING_DIR}/test_report/output.xml
           wait $helm_test_pid
           status=$?
-          rm -rf test_reports/
-          rebot -d test_reports --log api_log.html --report api_report.html --xunit api_xunit.xml output.xml
+          rebot -d ${WORKING_DIR}/test_report --log api_log.html --report api_report.html \
+            --xunit api_xunit.xml ${WORKING_DIR}/test_report/output.xml
           echo "::set-output name=has_artifacts::true"
           exit $status
       - name: Collect logs from pods
         if: always()
         run: |
-          rm -rf pods_logs
-          mkdir pods_logs && cd pods_logs
+          mkdir ${WORKING_DIR}/pods_logs && cd ${WORKING_DIR}/pods_logs
           for pod in $(kubectl get pods -n ${NAMESPACE} -o json | jq -r ".items[].metadata.name"); do
             mkdir $pod && pushd $pod
             kubectl -n ${NAMESPACE} get pod $pod -o json | jq ".status.containerStatuses[]" > status.info
@@ -139,24 +152,24 @@ jobs:
             popd
           done
       - name: Archive logs from pods
-        if: always()
+        if: always() && gihub.actor != 'local'
         uses: actions/upload-artifact@v2
         with:
-          name: logs-${{ matrix.source }}_${{ matrix.action }}
-          path: pods_logs/*
+          name: pods_logs-${{ matrix.source }}_${{ matrix.action }}
+          path: ${{ env.WORKING_DIR }}/pods_logs/*
       - name: Archive test results
-        if: always() && steps.run_tests.outputs.has_artifacts
+        if: always() && steps.run_tests.outputs.has_artifacts gihub.actor != 'local'
         uses: actions/upload-artifact@v2
         with:
           name: test_report-${{ matrix.source }}_${{ matrix.action }}
-          path: test_reports/*
+          path: ${{ env.WORKING_DIR }}/test_report/*
       - name: Process test results
         if: always() && steps.run_tests.outputs.has_artifacts
         uses: flaviodsr/junit-report-annotations-action@master
         with:
-          path: test_reports/api_xunit.xml
+          path: ${{ env.WORKING_DIR }}/test_report/api_xunit.xml
       - name: Update GitHub deployment status
-        if: always()
+        if: always() && gihub.actor != 'local'
         uses: tallyb/deployments@0.5.0
         with:
           step: finish
