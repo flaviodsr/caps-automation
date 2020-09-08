@@ -11,6 +11,7 @@ RUN zypper -n in \
       ca-certificates-suse \
       curl \
       docker \
+      git \
       gzip \
       helm \
       jq \
@@ -27,9 +28,10 @@ RUN wget https://releases.hashicorp.com/terraform/0.12.25/terraform_0.12.25_linu
   && mv terraform /usr/local/bin/ \
   && rm terraform_0.12.25_linux_amd64.zip
 
-RUN useradd -r -g ${GID} -d /github/home -m -l -c "runner default user" -u ${UID} ${USER}
+COPY group /etc/
+RUN useradd -r -g ${GID} -G docker -d /github/home -m -l -c "runner default user" -u ${UID} ${USER}
 
-USER ${UID}:${GID}
+USER ${UID}
 
 ENTRYPOINT ["/bin/bash"]
 CMD []
