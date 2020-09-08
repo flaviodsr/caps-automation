@@ -11,21 +11,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        source: [suse, devel, suse-to-devel]
-        action: [install, upgrade]
+        # devel ->    Devel:CAPS:Registry:2.0
+        # suse  ->    SUSE:SLE-15-SP2:Update:Products:CAPS-Registry:2.0
+        # official -> SUSE:Containers:CAPS:2
+        source: [devel, suse, official, official-to-devel, official-to-suse]
         include:
-          - source: suse
-            install_src: registry.suse.de/suse/sle-15-sp2/update/products/caps-registry/2.0
-            upgrade_src: registry.suse.de/suse/sle-15-sp2/update/products/caps-registry/2.0
           - source: devel
             install_src: registry.suse.de/devel/caps/registry/2.0
-            upgrade_src: registry.suse.de/devel/caps/registry/2.0
-          - source: suse-to-devel
+          - source: suse
             install_src: registry.suse.de/suse/sle-15-sp2/update/products/caps-registry/2.0
+          - source: official
+            install_src: registry.suse.de/suse/containers/caps/2
+          - source: official-to-devel
+            install_src: registry.suse.de/suse/containers/caps/2
             upgrade_src: registry.suse.de/devel/caps/registry/2.0
-        exclude:
-          - source: suse-to-devel
-            action: install
+          - source: official-to-suse
+            install_src: registry.suse.de/suse/containers/caps/2
+            upgrade_src: registry.suse.de/suse/sle-15-sp2/update/products/caps-registry/2.0
     env:
       HELM_EXPERIMENTAL_OCI: 1
     steps:
@@ -34,10 +36,10 @@ jobs:
         run: |
           case "${GITHUB_EVENT_NAME}" in
             schedule|workflow_dispatch)
-              working_dir="test_suse_private_registry/spr20-sched-${{ matrix.source }}-${{ matrix.action }}"
+              working_dir="test_suse_private_registry/spr20-sched-${{ matrix.source }}"
               echo "::set-output name=env_ref::release-2.0"
               echo "::set-output name=env_name::periodic-2.0"
-              echo "::set-env name=NAMESPACE::spr20-sched-${{ matrix.source }}-${{ matrix.action }}"
+              echo "::set-env name=NAMESPACE::spr20-sched-${{ matrix.source }}"
               echo "::set-env name=WORKING_DIR::${working_dir}"
               ;;
             *)
@@ -64,7 +66,6 @@ jobs:
           fi
           echo "::set-env name=KUBECONFIG::$(realpath ${kubeconfig})"
       - name: Delete previous deployment
-        if: matrix.action == 'install' || matrix.source == 'suse-to-devel'
         run: |
           kubectl delete ns ${NAMESPACE} || true
           kubectl create ns ${NAMESPACE}
@@ -92,10 +93,9 @@ jobs:
         with:
           step: start
           token: ${{ github.token }}
-          env: ${{ steps.setup.outputs.env_name }} (${{ matrix.source }}, ${{ matrix.action }})
+          env: ${{ steps.setup.outputs.env_name }} (${{ matrix.source }})
           ref: ${{ steps.setup.outputs.env_ref }}
       - name: SUSE Private Registry (install)
-        if: matrix.action == 'install' || matrix.source == 'suse-to-devel'
         run: |
           helm chart pull ${{ matrix.install_src }}/charts/registry/harbor:latest
           helm chart export ${{ matrix.install_src }}/charts/registry/harbor:latest -d ${WORKING_DIR}
@@ -105,7 +105,7 @@ jobs:
           helm install ${NAMESPACE} ${chart} -n ${NAMESPACE} --values ${WORKING_DIR}/${NAMESPACE}.yaml \
             --timeout 8m --wait
       - name: SUSE Private Registry (upgrade)
-        if: matrix.action == 'upgrade' || matrix.source == 'suse-to-devel'
+        if: matrix.upgrade_src
         run: |
           kubectl create ns ${NAMESPACE} || true
           helm chart pull ${{ matrix.upgrade_src }}/charts/registry/harbor:latest
@@ -114,7 +114,7 @@ jobs:
           # replace images repository according to source
           sed -i 's,registry.suse.com,${{ matrix.upgrade_src }}/containers,g' ${chart}/values.yaml
           helm upgrade ${NAMESPACE} ${chart} -n ${NAMESPACE} --values ${WORKING_DIR}/${NAMESPACE}.yaml \
-            --install --timeout 8m --wait
+            --timeout 8m --wait
       - name: Run tests
         id: run_tests
         run: |
@@ -155,13 +155,13 @@ jobs:
         if: always() && gihub.actor != 'local'
         uses: actions/upload-artifact@v2
         with:
-          name: pods_logs-${{ matrix.source }}_${{ matrix.action }}
+          name: pods_logs-${{ matrix.source }}
           path: ${{ env.WORKING_DIR }}/pods_logs/*
       - name: Archive test results
         if: always() && steps.run_tests.outputs.has_artifacts gihub.actor != 'local'
         uses: actions/upload-artifact@v2
         with:
-          name: test_report-${{ matrix.source }}_${{ matrix.action }}
+          name: test_report-${{ matrix.source }}
           path: ${{ env.WORKING_DIR }}/test_report/*
       - name: Process test results
         if: always() && steps.run_tests.outputs.has_artifacts
