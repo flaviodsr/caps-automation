@@ -6,7 +6,7 @@ on:
 
 jobs:
   deploy_caasp:
-    name: Deploy CaaSP 4
+    name: Deploy CaaSP
     runs-on: ecosystem-ci-runners
     env:
       NUMBER_OF_CLUSTERS: 2
@@ -25,21 +25,22 @@ jobs:
         if: github.actor != 'local'
         id: fetch_artifacts
         run: |
+          rm -rf CLUSTER_ID
           artifact_name=cluster-id
-          previous_runs_artifacts_url=$(curl -sH "${GH_API_HEADER}" \
+          previous_runs_artifacts_url="$(curl -sH "${GH_API_HEADER}" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/cluster-rotate.yml/runs\?status\=completed \
-            | jq -r ".workflow_runs[].artifacts_url")
-          for artifact_url in "${previous_runs_artifacts_url}"; do
+            | jq -r ".workflow_runs[].artifacts_url")"
+          for artifact_url in ${previous_runs_artifacts_url}; do
             cluster_id_artifact_download_url=$(curl -sH "${GH_API_HEADER}" ${artifact_url} \
               | jq -rc ".artifacts[] | select(.name==\"${artifact_name}\") | .archive_download_url")
-            if [[ ! -z "${cluster_id_artifact_download_url}" ]]; then
-              curl -sLH "${GH_API_HEADER}" ${cluster_id_artifact_download_url} --output ${artifact_name}.zip
+            if [[ ! -z ${cluster_id_artifact_download_url} ]]; then
+              wget --header="${GH_API_HEADER}" ${cluster_id_artifact_download_url} -O ${artifact_name}.zip
               unzip -o ${artifact_name}.zip
               break
             fi
           done
           echo "::set-output name=previous_runs_artifacts_url::${previous_runs_artifacts_url//$'\n'/'%0A'}"
-      - name: Set cluster ID
+      - name: Set cluster ID and prefix
         id: set_cluster_id
         run: |
           cluster_id_file="CLUSTER_ID"
@@ -52,11 +53,12 @@ jobs:
           else
             cluster_id=$(($active_cluster_id + 1))
           fi
-          cluster_prefix="${GITHUB_REPOSITORY#*/}-ci"
-          if [[ "${GITHUB_ACTOR}" = "local" ]]; then
-            cluster_prefix="${GITHUB_REPOSITORY%/*}"
+          git_repository="${GITHUB_REPOSITORY#*/}"
+          git_repository_owner="${GITHUB_REPOSITORY%/*}"
+          cluster_prefix="${git_repository}-ci"
+          if [[ "${GITHUB_ACTOR}" = "local" || "${git_repository_owner}" != "suse" ]]; then
+            cluster_prefix="${git_repository_owner}"
           fi
-          echo "${cluster_id}" > CLUSTER_ID
           echo "::set-output name=cluster_id::${cluster_id}"
           echo "::set-env name=CLUSTER_NAME::${cluster_prefix}${cluster_id}"
           echo "::set-env name=ARTIFACT_DIR::catapult/build${cluster_prefix}${cluster_id}"
@@ -64,16 +66,17 @@ jobs:
         env:
           sec_openrc: ${{ secrets.OPENRC }}
         run: echo "$sec_openrc" | base64 -d > ./.openrc
-      - name: Get deployment arficats from previuos run
+      - name: Get deployment artifacts from previous run
         if: steps.fetch_artifacts.outputs.previous_runs_artifacts_url && github.actor != 'local'
         id: artifact_download
         run: |
           artifact_name=deployment-${CLUSTER_NAME}
-          for artifact_url in "${{ steps.fetch_artifacts.outputs.previous_runs_artifacts_url }}" ; do
+          previous_runs_artifacts_url="${{ steps.fetch_artifacts.outputs.previous_runs_artifacts_url }}"
+          for artifact_url in ${previous_runs_artifacts_url} ; do
             artifact_download_url=$(curl -sH "${GH_API_HEADER}" ${artifact_url} \
               | jq -rc ".artifacts[] | select(.name==\"${artifact_name}\") | .archive_download_url")
             if [[ ! -z "${artifact_download_url}" ]]; then
-              curl -sLH "${GH_API_HEADER}" $artifact_download_url --output ${artifact_name}.zip
+              wget --header="${GH_API_HEADER}" ${artifact_download_url} -O ${artifact_name}.zip
               rm -rf ${ARTIFACT_DIR}
               mkdir -p ${ARTIFACT_DIR}
               unzip ${artifact_name}.zip -d ${ARTIFACT_DIR}
@@ -95,9 +98,11 @@ jobs:
         run: |
           if [ -d "${ARTIFACT_DIR}/deployment" ]; then
             . ./.openrc
-            cd ${ARTIFACT_DIR}/deployment
+            pushd ${ARTIFACT_DIR}/deployment
             terraform init
             terraform destroy -auto-approve
+            popd
+            rm -rf ${ARTIFACT_DIR}
           fi
       - name: Checkout catapult repository
         run: |
@@ -118,15 +123,14 @@ jobs:
           echo "::set-output name=step_reached::true"
           OWNER=${CLUSTER_NAME} BACKEND=caasp4os make k8s
           echo "::set-env name=KUBECONFIG::$(realpath build${{ env.CLUSTER_NAME }}/kubeconfig)"
-      - name: Archieve deployment artifacts
+      - name: Archive deployment artifacts
         if: always() && steps.deploy_cluster.outputs.step_reached && github.actor != 'local'
         uses: actions/upload-artifact@v2
         with:
           name: deployment-${{ env.CLUSTER_NAME }}
           path: |
-            catapult/build${{ env.CLUSTER_NAME }}/deployment
-            catapult/build${{ env.CLUSTER_NAME }}/id_rsa_shared
-            catapult/build${{ env.CLUSTER_NAME }}/kubeconfig
+            deploy_caasp/catapult/build${{ env.CLUSTER_NAME }}
+            !deploy_caasp/catapult/build${{ env.CLUSTER_NAME }}/bin
       - name: Deploy NGINX ingress controller
         run: |
           cat << EOF | tee nginx-ingress-config-values.yaml
@@ -139,12 +143,11 @@ jobs:
           helm repo add suse https://kubernetes-charts.suse.com
           kubectl create ns nginx-ingress
           helm -n nginx-ingress install nginx-ingress suse/nginx-ingress -f nginx-ingress-config-values.yaml --wait --timeout 5m
-      - name: Keep current cluster as active if this deployment fails
-        if: env.ACTIVE_CLUSTER_ID && (failure() || (cancelled() && steps.deploy_cluster.outputs.step_reached))
-        run: echo ${ACTIVE_CLUSTER_ID} > CLUSTER_ID
-      - name: Save active cluster ID
+      - name: Save new CLUSTER_ID
+        run: echo "${{ steps.set_cluster_id.outputs.cluster_id }}" > CLUSTER_ID
+      - name: Archive cluster ID
         if: always() && github.actor != 'local'
         uses: actions/upload-artifact@v2
         with:
           name: cluster-id
-          path: CLUSTER_ID
+          path: deploy_caasp/CLUSTER_ID
