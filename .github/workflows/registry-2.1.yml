@@ -14,7 +14,7 @@ on:
 env:
   REGISTRY_VERSION: "2.1"
   CHART_VERSION: "1.5"
-  RC_CHANNEL: "#ecosystem-ci"
+  RC_CHANNEL: "#eco-ci-test"
   HELM_EXPERIMENTAL_OCI: 1
   HELM_CACHE_HOME: ".cache"
   HELM_CONFIG_HOME: ".config"
@@ -152,9 +152,8 @@ jobs:
           chart="./harbor"
           # replace images repository according to source
           sed -i 's,registry.suse.com,${{ steps.set_env.outputs.img_install_src }}/containers,g' ${chart}/values.yaml
-          # create suse-ca secret for pulling test images from private-registry.prv.suse.net
-          kubectl -n ${NAMESPACE} create secret generic suse-ca --from-file \
-            ca.crt=$(rpm -ql ca-certificates-suse | grep crt)
+          curl -kX GET "https://rke-registry.10.162.66.100.nip.io/api/v2.0/systeminfo/getcert" | tee harbor-ca.crt
+          kubectl -n ${NAMESPACE} create secret generic suse-ca --from-file ca.crt=harbor-ca.crt
           helm install ${NAMESPACE} ${chart} -n ${NAMESPACE} --values ci-values.yaml --timeout 10m --wait
 
       - name: SUSE Private Registry (upgrade)

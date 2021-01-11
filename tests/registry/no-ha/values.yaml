@@ -29,6 +29,6 @@ trivy:
 
 tests:
   dockerCredentials:
-    username: suseecosystem
+    username: flaviosr
     password: "${dh_access_token}"
-  imagesPullRepository: private-registry.prv.suse.net/dockerhub
+  imagesPullRepository: rke-registry.10.162.66.100.nip.io
